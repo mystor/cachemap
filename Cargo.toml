@@ -1,0 +1,11 @@
+[package]
+name = "cachemap"
+version = "0.1.0"
+authors = ["Nika Layzell <nika@thelayzells.com>"]
+edition = "2018"
+
+[dependencies]
+stable_deref_trait = "1.1"
+parking_lot = "0.7"
+hashbrown = "0.1"
+
