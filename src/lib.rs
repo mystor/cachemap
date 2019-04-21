@@ -1,16 +1,36 @@
-use hashbrown::hash_map::{self, HashMap};
-use parking_lot::{Mutex, MutexGuard};
+#![cfg_attr(feature = "raw_entry", feature(hash_raw_entry))]
+
 use stable_deref_trait::StableDeref;
 
 use std::borrow::Borrow;
+use std::collections::hash_map::{self, HashMap};
 use std::hash::{BuildHasher, Hash};
-use std::mem;
+use std::sync::{Mutex, MutexGuard};
 
-pub struct CacheMap<K, V, S = hash_map::DefaultHashBuilder> {
+/// internal helper macro - performs a transmute cast to relax lifetime
+/// parameters on an object with the given type.
+///
+/// Unsafe to use, as it violates borrow-checker guarantees.
+macro_rules! unsafe_relax_lifetime {
+    ($e:expr, $t:ty) => {
+        {
+            // Rustc doesn't understand that two generic types with mismatched
+            // lifetime parameters are the same size, so `transmute_copy` has to
+            // be used instead, followed by a `forget` to clean up the old
+            // value.
+            let e = $e;
+            let e2 = unsafe { ::std::mem::transmute_copy::<$t, $t>(&e) };
+            ::std::mem::forget(e);
+            e2
+        }
+    };
+}
+
+pub struct CacheMap<K, V, S = hash_map::RandomState> {
     map: Mutex<HashMap<K, V, S>>,
 }
 
-impl<K, V> CacheMap<K, V, hash_map::DefaultHashBuilder>
+impl<K, V> CacheMap<K, V, hash_map::RandomState>
 where
     K: Hash + Eq,
 {
@@ -21,8 +41,14 @@ where
 
 impl<K, V, S> CacheMap<K, V, S> {
     /// Entry point for `CacheMap`'s raw entry API.
+    #[cfg(feature = "raw_entry")]
     pub fn raw_entry<'a>(&'a self) -> RawEntryBuilder<'a, K, V, S> {
-        RawEntryBuilder { map: &self.map }
+        RawEntryBuilder { map: self }
+    }
+
+    /// Acquire the internal lock, ignoring poisoning.
+    fn lock(&self) -> MutexGuard<HashMap<K, V, S>> {
+        self.map.lock().unwrap_or_else(|pe| pe.into_inner())
     }
 }
 
@@ -31,17 +57,6 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    pub fn contains<Q: ?Sized>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        match self.raw_entry().from_key(key) {
-            RawEntry::Occupied(_) => true,
-            RawEntry::Vacant(_) => false,
-        }
-    }
-
     /// Get the value stored for a given key, if it exists in the map.
     pub fn get<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V::Target>
     where
@@ -49,76 +64,36 @@ where
         Q: Hash + Eq,
         V: StableDeref,
     {
-        match self.raw_entry().from_key(key) {
-            RawEntry::Occupied(entry) => Some(entry.get()),
-            _ => None,
-        }
-    }
-
-    pub fn get_key_value<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<(&'a K::Target, &'a V::Target)>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-        K: StableDeref,
-        V: StableDeref,
-    {
-        match self.raw_entry().from_key(key) {
-            RawEntry::Occupied(entry) => Some((entry.key(), entry.get())),
-            _ => None,
-        }
+        self.lock()
+            .get(key)
+            .map(|rv| unsafe_relax_lifetime!(&**rv, &'_ V::Target))
     }
 
     /// Attempt to insert the given key/value pair into the map. Returns `true`
     /// if the new entry was successfully added, and `false` if the value already
     /// exists in the map.
     pub fn insert<'a>(&'a self, key: K, value: V) -> bool {
-        self.insert_with(key, || value)
+        self.lock().insert(key, value).is_none()
     }
 
-    /// Attempt to insert the given key/value pair into the map. Returns `true`
-    /// if the new entry was successfully added, and `false` if the value already
-    /// exists in the map.
+    /// Entry point for the `entry` API on `cachemap`.
     ///
-    /// The passed-in thunk is only evaluated if the key doesn't already exist in
-    /// the map.
-    pub fn insert_with<'a, F>(&'a self, key: K, thunk: F) -> bool
-    where
-        F: FnOnce() -> V,
-    {
-        match self.raw_entry().from_key(&key) {
-            RawEntry::Occupied(_) => false,
-            RawEntry::Vacant(entry) => {
-                entry.insert(key, thunk());
-                true
-            }
-        }
-    }
+    /// An internal lock will be held while the `Entry` object is alive,
+    /// preventing other reads or mutations.
+    pub fn entry<'a>(&'a self, key: K) -> Entry<'a, K, V, S> {
+        let mut guard = self.lock();
 
-    /// Attempt to insert the given key/value pair into the map. Returns `Ok(ref)`
-    /// if the new entry was successfully added, and `Err(ref)` if an entry
-    /// already exists.
-    pub fn insert_ref<'a>(&'a self, key: K, value: V) -> Result<&'a V::Target, &'a V::Target>
-    where
-        V: StableDeref,
-    {
-        self.insert_ref_with(key, || value)
-    }
-
-    /// Attempt to insert the given key/value pair into the map. Returns `Ok(ref)`
-    /// if the new entry was successfully added, and `Err(ref)` if an entry
-    /// already exists.
-    pub fn insert_ref_with<'a, F>(
-        &'a self,
-        key: K,
-        thunk: F,
-    ) -> Result<&'a V::Target, &'a V::Target>
-    where
-        F: FnOnce() -> V,
-        V: StableDeref,
-    {
-        match self.raw_entry().from_key(&key) {
-            RawEntry::Occupied(entry) => Err(entry.get()),
-            RawEntry::Vacant(entry) => Ok(entry.insert(key, thunk()).get()),
+        // Relax the lifetime of the entry object such that it can be stored in
+        // the same struct as the guard without violating the borrow-checker.
+        match unsafe_relax_lifetime!(guard.entry(key), hash_map::Entry<'_, K, V>) {
+            hash_map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry {
+                _guard: guard,
+                entry: entry,
+            }),
+            hash_map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry {
+                _guard: guard,
+                entry: entry,
+            }),
         }
     }
 }
@@ -135,11 +110,114 @@ where
     }
 }
 
-/// A builder for computing where in a hash map a key-value pair would be stored.
-pub struct RawEntryBuilder<'a, K, V, S> {
-    map: &'a Mutex<HashMap<K, V, S>>,
+pub enum Entry<'a, K, V, S> {
+    Occupied(OccupiedEntry<'a, K, V, S>),
+    Vacant(VacantEntry<'a, K, V, S>),
 }
 
+impl<'a, K, V, S> Entry<'a, K, V, S> {
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(e) => e.key(),
+            Entry::Vacant(e) => e.key(),
+        }
+    }
+}
+
+impl<'a, K, V, S> Entry<'a, K, V, S>
+where
+    V: StableDeref,
+{
+    pub fn or_insert(self, default: V) -> &'a V::Target {
+        self.or_insert_with(|| default)
+    }
+
+    pub fn or_insert_with<F>(self, default: F) -> &'a V::Target
+    where
+        F: FnOnce() -> V,
+    {
+        match self {
+            Entry::Occupied(e) => e.get_ref(),
+            Entry::Vacant(e) => e.insert(default()),
+        }
+    }
+}
+
+pub struct OccupiedEntry<'a, K, V, S> {
+    _guard: MutexGuard<'a, HashMap<K, V, S>>,
+    entry: hash_map::OccupiedEntry<'a, K, V>,
+}
+
+impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
+    pub fn key(&self) -> &K {
+        self.entry.key()
+    }
+
+    pub fn get(&self) -> &V {
+        self.entry.get()
+    }
+
+    pub fn key_ref(&self) -> &'a K::Target
+    where
+        K: StableDeref,
+    {
+        unsafe_relax_lifetime!(&**self.key(), &'_ K::Target)
+    }
+
+    pub fn get_ref(&self) -> &'a V::Target
+    where
+        V: StableDeref,
+    {
+        unsafe_relax_lifetime!(&**self.get(), &'_ V::Target)
+    }
+}
+
+pub struct VacantEntry<'a, K, V, S> {
+    _guard: MutexGuard<'a, HashMap<K, V, S>>,
+    entry: hash_map::VacantEntry<'a, K, V>,
+}
+
+impl<'a, K, V, S> VacantEntry<'a, K, V, S> {
+    pub fn key(&self) -> &K {
+        self.entry.key()
+    }
+
+    pub fn into_key(self) -> K {
+        self.entry.into_key()
+    }
+
+    pub fn insert_raw(self, value: V) {
+        self.entry.insert(value);
+    }
+
+    pub fn insert(self, value: V) -> &'a V::Target
+    where
+        V: StableDeref,
+    {
+        let tgt = &*value as *const V::Target;
+        self.insert_raw(value);
+        unsafe { &*tgt }
+    }
+
+    pub fn insert_key_value(self, value: V) -> (&'a K::Target, &'a V::Target)
+    where
+        K: StableDeref,
+        V: StableDeref,
+    {
+        let key = &**self.key() as *const K::Target;
+        let tgt = &*value as *const V::Target;
+        self.insert_raw(value);
+        unsafe { (&*key, &*tgt) }
+    }
+}
+
+/// A builder for computing where in a hash map a key-value pair would be stored.
+#[cfg(feature = "raw_entry")]
+pub struct RawEntryBuilder<'a, K, V, S> {
+    map: &'a CacheMap<K, V, S>,
+}
+
+#[cfg(feature = "raw_entry")]
 impl<'a, K, V, S> RawEntryBuilder<'a, K, V, S>
 where
     K: Eq + Hash,
@@ -182,13 +260,7 @@ where
 
         // Clear out the lifetime information for `base_entry` so we can put it
         // in the same struct as `guard`.
-        let entry = unsafe {
-            mem::transmute::<
-                hash_map::RawEntryMut<'_, K, V, S>,
-                hash_map::RawEntryMut<'a, K, V, S>,
-            >(base_entry)
-        };
-
+        let entry = unsafe_relax_lifetime!(base_entry, hash_map::RawEntryMut<'_, K, V, S>);
         match entry {
             hash_map::RawEntryMut::Occupied(entry) => {
                 let (key, value) = entry.into_key_value();
@@ -213,11 +285,13 @@ where
 /// This object holds a lock on the target `CacheMap`'s internal data structure,
 /// meaning that the `CacheMap` will be unavailable for reading or writing while
 /// this object is alive.
+#[cfg(feature = "raw_entry")]
 pub enum RawEntry<'a, K, V, S> {
     Occupied(RawOccupiedEntry<'a, K, V, S>),
     Vacant(RawVacantEntry<'a, K, V, S>),
 }
 
+#[cfg(feature = "raw_entry")]
 impl<'a, K, V, S> RawEntry<'a, K, V, S> {
     /// If this entry doesn't exist in the map yet, insert it with the given
     /// key/value. Returns a known-occupied entry.
@@ -264,6 +338,7 @@ impl<'a, K, V, S> RawEntry<'a, K, V, S> {
 /// This object holds a lock on the target `CacheMap`'s internal data structure,
 /// meaning that the `CacheMap` will be unavailable for reading or writing while
 /// this object is alive.
+#[cfg(feature = "raw_entry")]
 pub struct RawOccupiedEntry<'a, K, V, S> {
     _guard: MutexGuard<'a, HashMap<K, V, S>>,
     // WARNING: These lifetimes are lies, don't hand out references for the full
@@ -272,6 +347,7 @@ pub struct RawOccupiedEntry<'a, K, V, S> {
     unsafe_value: &'a V,
 }
 
+#[cfg(feature = "raw_entry")]
 impl<'a, K, V, S> RawOccupiedEntry<'a, K, V, S> {
     /// Borrow a reference to the raw key stored in the map.
     pub fn key_raw(&self) -> &K {
@@ -313,11 +389,13 @@ impl<'a, K, V, S> RawOccupiedEntry<'a, K, V, S> {
 /// This object holds a lock on the target `CacheMap`'s internal data structure,
 /// meaning that the `CacheMap` will be unavailable for reading or writing while
 /// this object is alive.
+#[cfg(feature = "raw_entry")]
 pub struct RawVacantEntry<'a, K, V, S> {
     _guard: MutexGuard<'a, HashMap<K, V, S>>,
     entry: hash_map::RawVacantEntryMut<'a, K, V, S>,
 }
 
+#[cfg(feature = "raw_entry")]
 impl<'a, K, V, S> RawVacantEntry<'a, K, V, S> {
     /// Fill this vacant entry with the given key/value pair. Returns a now
     /// known-occupied entry.
@@ -355,37 +433,26 @@ fn make() {
     let map = CacheMap::new();
     map.insert("Hello", "World");
 
-    assert_eq!(map.get_key_value("Hello"), Some(("Hello", "World")));
+    // assert_eq!(map.get_key_value("Hello"), Some(("Hello", "World")));
 }
 
-/*
 #[test]
-fn unsafe_thing() {
+fn loopy() {
     use std::cell::Cell;
     #[derive(Debug)]
-    struct UnsafeThing<'a> {
+    struct LoopyThing<'a> {
         payload: u32,
-        other: Cell<Option<&'a UnsafeThing<'a>>>,
-    }
-
-    impl<'a> Drop for UnsafeThing<'a> {
-        fn drop(&mut self) {
-            if let Some(other) = self.other.get() {
-                println!("other.payload = {}", other.payload);
-            } else {
-                println!("other is None");
-            }
-        }
+        other: Cell<Option<&'a LoopyThing<'a>>>,
     }
 
     let map = CacheMap::new();
-    let one = map.insert_ref(1, Box::new(UnsafeThing {
+    let one = map.entry(1).or_insert(Box::new(LoopyThing {
         payload: 1,
         other: Cell::new(None),
-    })).unwrap();
-    let two = map.insert_ref(2, Box::new(UnsafeThing {
+    }));
+    let two = map.entry(2).or_insert(Box::new(LoopyThing {
         payload: 2,
         other: Cell::new(Some(one)),
-    })).unwrap();
+    }));
+    one.other.set(Some(two))
 }
-*/
