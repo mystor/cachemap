@@ -26,6 +26,11 @@ macro_rules! unsafe_relax_lifetime {
     };
 }
 
+/// An append-only threadsafe hash map, with arena-like allocation behaviour. All
+/// operations on `CacheMap` may be performed with non-`mut` references.
+///
+/// If the key or value is `StableDeref`, methods will return a shared reference
+/// to their target which may live as long as the `CacheMap` itself.
 pub struct CacheMap<K, V, S = hash_map::RandomState> {
     map: Mutex<HashMap<K, V, S>>,
 }
@@ -110,12 +115,19 @@ where
     }
 }
 
+/// A view into a single entry in a map, which may either be vacant or occupied.
+///
+/// While this object is alive, a lock is held on the `CacheMap`, meaning no
+/// other accesses or mutations may be performed.
+///
+/// This `enum` is constructed from the `entry` method on `CacheMap`.
 pub enum Entry<'a, K, V, S> {
     Occupied(OccupiedEntry<'a, K, V, S>),
     Vacant(VacantEntry<'a, K, V, S>),
 }
 
 impl<'a, K, V, S> Entry<'a, K, V, S> {
+    /// Returns a reference to the entry's key.
     pub fn key(&self) -> &K {
         match self {
             Entry::Occupied(e) => e.key(),
@@ -128,10 +140,14 @@ impl<'a, K, V, S> Entry<'a, K, V, S>
 where
     V: StableDeref,
 {
+    /// Ensures a value is in the entry by inserting the default if empty, and
+    /// returns a reference to the value in the entry.
     pub fn or_insert(self, default: V) -> &'a V::Target {
         self.or_insert_with(|| default)
     }
 
+    /// Ensures a value is in the entry by inserting the result of the default
+    /// function if empty, and returns a reference to the value in the entry.
     pub fn or_insert_with<F>(self, default: F) -> &'a V::Target
     where
         F: FnOnce() -> V,
@@ -143,20 +159,29 @@ where
     }
 }
 
+/// A view into an occupied entry in the `CacheMap`. It is part of the `Entry` enum.
+///
+/// While this object is alive, a lock is held on the `CacheMap`, meaning no
+/// other accesses or mutations may be performed.
 pub struct OccupiedEntry<'a, K, V, S> {
     _guard: MutexGuard<'a, HashMap<K, V, S>>,
     entry: hash_map::OccupiedEntry<'a, K, V>,
 }
 
 impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
+    /// Returns a reference to the raw key in the entry.
     pub fn key(&self) -> &K {
         self.entry.key()
     }
 
+    /// Returns a reference to the raw value in the entry.
     pub fn get(&self) -> &V {
         self.entry.get()
     }
 
+    /// Returns a stable reference to the key in the entry.
+    ///
+    /// The return value of this type may outlive the `OccupiedEntry` object.
     pub fn key_ref(&self) -> &'a K::Target
     where
         K: StableDeref,
@@ -164,6 +189,9 @@ impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
         unsafe_relax_lifetime!(&**self.key(), &'_ K::Target)
     }
 
+    /// Returns a stable reference to the value in the entry.
+    ///
+    /// The return value of this type may outlive the `OccupiedEntry` object.
     pub fn get_ref(&self) -> &'a V::Target
     where
         V: StableDeref,
@@ -172,24 +200,35 @@ impl<'a, K, V, S> OccupiedEntry<'a, K, V, S> {
     }
 }
 
+/// A view into a vacant entry in the `CacheMap`. It is part of the `Entry` enum.
+///
+/// While this object is alive, a lock is held on the `CacheMap`, meaning no
+/// other accesses or mutations may be performed.
 pub struct VacantEntry<'a, K, V, S> {
     _guard: MutexGuard<'a, HashMap<K, V, S>>,
     entry: hash_map::VacantEntry<'a, K, V>,
 }
 
 impl<'a, K, V, S> VacantEntry<'a, K, V, S> {
+    /// Get a reference to the key which would be used when inserting a value
+    /// through this `VacantEntry`.
     pub fn key(&self) -> &K {
         self.entry.key()
     }
 
+    /// Take ownership of the key.
     pub fn into_key(self) -> K {
         self.entry.into_key()
     }
 
+    /// Insert a value into the `CacheMap`. Unlike `insert`, this method does not
+    /// return a reference to the inserted entry, and does not require
+    /// `StableDeref`.
     pub fn insert_raw(self, value: V) {
         self.entry.insert(value);
     }
 
+    /// Insert a value into the `CacheMap`, returning a stable reference to it.
     pub fn insert(self, value: V) -> &'a V::Target
     where
         V: StableDeref,
@@ -199,6 +238,8 @@ impl<'a, K, V, S> VacantEntry<'a, K, V, S> {
         unsafe { &*tgt }
     }
 
+    /// Insert a value into the `CacheMap`, returning stable references to both
+    /// the inserted key and value.
     pub fn insert_key_value(self, value: V) -> (&'a K::Target, &'a V::Target)
     where
         K: StableDeref,
